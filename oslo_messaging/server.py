@@ -41,6 +41,7 @@ from stevedore import driver
 from oslo_messaging._drivers import base as driver_base
 from oslo_messaging._i18n import _LW
 from oslo_messaging import exceptions
+from oslo_messaging import metrics
 
 LOG = logging.getLogger(__name__)
 
@@ -55,6 +56,18 @@ _pool_opts = [
                deprecated_name="rpc_thread_pool_size",
                help='Size of executor thread pool when'
                ' executor is threading or eventlet.'),
+]
+
+_metrics_opts = [
+    cfg.IntOpt('statsd_port',
+               default=8125,
+               help='Port of the statsd service.'),
+    cfg.StrOpt('statsd_host',
+               default='localhost',
+               help='Host of the statsd service.'),
+    cfg.BoolOpt('statsd_enabled',
+               default=False,
+               help='Enables/Disables the metrics statsd server.'),
 ]
 
 
@@ -329,6 +342,11 @@ class MessageHandlingServer(service.ServiceBase, _OrderedTaskRunner):
         """
         self.conf = transport.conf
         self.conf.register_opts(_pool_opts)
+        self.conf.register_opts(_metrics_opts)
+
+        if self.conf.statsd_enabled:
+            self.metrics = metrics.Metrics(self.conf.statsd_host, self.conf.statsd_port)
+            self.metrics.start()
 
         self.transport = transport
         self.dispatcher = dispatcher
