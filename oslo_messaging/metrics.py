@@ -27,6 +27,7 @@ class Metrics(object):
             incoming = self.queue.get(timeout=1.0, block=True)
          except queue.Empty:
             continue
+
          try:
             message = incoming['message'].message
             method = message.get('method')

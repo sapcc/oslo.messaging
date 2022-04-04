@@ -165,9 +165,7 @@ class RPCServer(msg_server.MessageHandlingServer):
             LOG.exception(_LE("Can not acknowledge message. Skip processing"))
             return
 
-
         self.put_metrics_queue(message, 'event')
-
         failure = None
         try:
             res = self.dispatcher.dispatch(message)
