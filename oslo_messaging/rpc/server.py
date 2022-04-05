@@ -180,7 +180,7 @@ class RPCServer(msg_server.MessageHandlingServer):
             # by another exception raised by a log handler during
             # LOG.exception(). So keep a copy and delete it later.
             failure = sys.exc_info()
-            LOG.exception('Exception during message handling')
+            LOG.exception(_LE('Exception during message handling'))
 
             self.put_metrics_queue(message, 'exception')
 
