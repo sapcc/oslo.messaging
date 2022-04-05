@@ -131,6 +131,7 @@ import logging
 try:
     import queue
 except ImportError:
+    # python2 compatibility
     import Queue as queue
 import sys
 
