@@ -121,6 +121,7 @@ A simple example of an RPC server with multiple endpoints might be::
 """
 
 import logging
+import queue
 import sys
 
 from oslo_messaging import exceptions
@@ -160,6 +161,7 @@ class RPCServer(msg_server.MessageHandlingServer):
             LOG.exception("Can not acknowledge message. Skip processing")
             return
 
+        self.put_metrics_queue(message, 'event')
         failure = None
         try:
             res = self.dispatcher.dispatch(message)
@@ -169,15 +171,19 @@ class RPCServer(msg_server.MessageHandlingServer):
             # LOG.debug(). So keep a copy and delete it later.
             failure = e.exc_info
             LOG.debug('Expected exception during message handling (%s)', e)
+            self.put_metrics_queue(message, 'expected_exception')
         except rpc_dispatcher.NoSuchMethod as e:
             failure = sys.exc_info()
             if e.method.endswith('_ignore_errors'):
                 LOG.debug('Method %s not found', e.method)
+                self.put_metrics_queue(message, 'no_such_method')
             else:
                 LOG.exception('Exception during message handling')
+                self.put_metrics_queue(message, 'exception')
         except Exception:
             failure = sys.exc_info()
             LOG.exception('Exception during message handling')
+            self.put_metrics_queue(message, 'exception')
 
         try:
             if failure is None:
@@ -197,6 +203,16 @@ class RPCServer(msg_server.MessageHandlingServer):
             # between the current stack frame and the traceback in
             # exc_info.
             del failure
+
+    def put_metrics_queue(self, message, tag):
+        if self.conf.statsd_enabled:
+            try:
+                self.metrics.queue.put_nowait({
+                    'message': message,
+                    'tag': tag,
+                })
+            except queue.Full:
+                LOG.warning("Statsd metrics queue is full")
 
 
 def get_rpc_server(transport, target, endpoints,
