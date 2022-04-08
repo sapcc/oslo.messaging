@@ -18,7 +18,7 @@ class Metrics(object):
         self.statsd = statsd.StatsClient(host, port)
 
     def start(self):
-        threading.Thread(target=self.counter, daemon=True).start()
+        threading.Thread(target=self.counter).start()
 
     def stop(self):
         self.stop_event.set()
