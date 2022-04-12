@@ -33,6 +33,7 @@ from stevedore import driver
 
 from oslo_messaging._drivers import base as driver_base
 from oslo_messaging import exceptions
+from oslo_messaging import metrics
 
 __all__ = [
     'ExecutorLoadFailure',
@@ -54,6 +55,18 @@ _pool_opts = [
                deprecated_name="rpc_thread_pool_size",
                help='Size of executor thread pool when'
                ' executor is threading or eventlet.'),
+]
+
+_metrics_opts = [
+    cfg.IntOpt('statsd_port',
+               default=8125,
+               help='Port of the statsd service.'),
+    cfg.StrOpt('statsd_host',
+               default='localhost',
+               help='Host of the statsd service.'),
+    cfg.BoolOpt('statsd_enabled',
+               default=False,
+               help='Enables/Disables the metrics statsd server.'),
 ]
 
 
@@ -328,6 +341,10 @@ class MessageHandlingServer(service.ServiceBase, _OrderedTaskRunner):
         """
         self.conf = transport.conf
         self.conf.register_opts(_pool_opts)
+        self.conf.register_opts(_metrics_opts)
+
+        if self.conf.statsd_enabled:
+            self.metrics = metrics.Metrics(self.conf.statsd_host, self.conf.statsd_port)
 
         self.transport = transport
         self.dispatcher = dispatcher
@@ -415,6 +432,9 @@ class MessageHandlingServer(service.ServiceBase, _OrderedTaskRunner):
             raise ServerListenError(self.target, ex)
 
         self.listener.start(self._on_incoming)
+        
+        if self.conf.statsd_enabled:
+            self.metrics.start()
 
     @ordered(after='start')
     def stop(self):
@@ -445,6 +465,9 @@ class MessageHandlingServer(service.ServiceBase, _OrderedTaskRunner):
         # Close listener connection after processing all messages
         if self.listener:
             self.listener.cleanup()
+
+        if self.conf.statsd_enabled:
+            self.metrics.stop()
 
     def reset(self):
         """Reset service.

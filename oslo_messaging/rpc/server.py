@@ -121,6 +121,7 @@ A simple example of an RPC server with multiple endpoints might be::
 """
 
 import logging
+import queue
 import sys
 
 from oslo_messaging import exceptions
@@ -160,18 +161,21 @@ class RPCServer(msg_server.MessageHandlingServer):
             LOG.exception("Can not acknowledge message. Skip processing")
             return
 
+        self.put_metrics_queue(message, 'event')
         failure = None
         try:
             res = self.dispatcher.dispatch(message)
         except rpc_dispatcher.ExpectedException as e:
             failure = e.exc_info
             LOG.debug(u'Expected exception during message handling (%s)', e)
+            self.put_metrics_queue(message, 'expected_exception')
         except Exception:
             # current sys.exc_info() content can be overridden
             # by another exception raised by a log handler during
             # LOG.exception(). So keep a copy and delete it later.
             failure = sys.exc_info()
             LOG.exception('Exception during message handling')
+            self.put_metrics_queue(message, 'exception')
 
         try:
             if failure is None:
@@ -191,6 +195,16 @@ class RPCServer(msg_server.MessageHandlingServer):
             # between the current stack frame and the traceback in
             # exc_info.
             del failure
+
+    def put_metrics_queue(self, message, tag):
+        if self.conf.statsd_enabled:
+            try:
+                self.metrics.queue.put_nowait({
+                    'message': message,
+                    'tag': tag,
+                })
+            except queue.Full:
+                LOG.warning("Statsd metrics queue is full")
 
 
 def get_rpc_server(transport, target, endpoints,
