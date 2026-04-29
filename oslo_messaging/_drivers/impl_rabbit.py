@@ -1297,6 +1297,22 @@ class Connection(object):
 
     def stop_consuming(self):
         self._consume_loop_stopped = True
+        # Send basic.cancel to the broker for each consumer so RabbitMQ
+        # stops delivering messages immediately. Without this, the broker
+        # considers the consumer alive until the channel is closed (which
+        # happens much later in cleanup()). During graceful shutdown this
+        # creates a "zombie consumer" window where the broker round-robins
+        # messages to a consumer that is no longer processing them, causing
+        # message loss during rolling upgrades.
+        with self._connection_lock:
+            for consumer, tag in self._consumers.items():
+                try:
+                    consumer.cancel(tag=tag)
+                except Exception:
+                    # Best-effort cancellation. If the channel is already
+                    # broken we'll clean up in close() anyway.
+                    LOG.debug("Failed to cancel consumer %s on "
+                              "stop_consuming", tag)
 
     def declare_direct_consumer(self, topic, callback):
         """Create a 'direct' queue.

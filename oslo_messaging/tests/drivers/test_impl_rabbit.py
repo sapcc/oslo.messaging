@@ -447,6 +447,75 @@ class TestRabbitConsume(test_utils.BaseTestCase):
                 self.assertNotEqual(channel, conn.connection.channel)
 
 
+class TestRabbitStopConsuming(test_utils.BaseTestCase):
+
+    def test_stop_consuming_cancels_consumers(self):
+        """Verify stop_consuming sends basic.cancel for each consumer.
+
+        Without basic.cancel, the broker continues delivering messages to
+        a stopped consumer during graceful shutdown, causing message loss
+        in rolling upgrade scenarios.
+        """
+        transport = oslo_messaging.get_transport(self.conf, 'kombu+memory://')
+        self.addCleanup(transport.cleanup)
+        with transport._driver._get_connection(
+                driver_common.PURPOSE_LISTEN) as conn:
+            conn.declare_topic_consumer(exchange_name='test',
+                                        topic='test',
+                                        callback=lambda msg: True)
+            # There should be one consumer registered
+            self.assertEqual(1, len(conn.connection._consumers))
+
+            with mock.patch.object(
+                rabbit_driver.Consumer, 'cancel'
+            ) as mock_cancel:
+                conn.connection.stop_consuming()
+
+                # Verify the flag is set
+                self.assertTrue(conn.connection._consume_loop_stopped)
+                # Verify cancel was called for each consumer
+                self.assertEqual(1, mock_cancel.call_count)
+
+    def test_stop_consuming_cancels_multiple_consumers(self):
+        """Verify all consumers are cancelled when there are multiple."""
+        transport = oslo_messaging.get_transport(self.conf, 'kombu+memory://')
+        self.addCleanup(transport.cleanup)
+        with transport._driver._get_connection(
+                driver_common.PURPOSE_LISTEN) as conn:
+            conn.declare_topic_consumer(exchange_name='test',
+                                        topic='test1',
+                                        callback=lambda msg: True)
+            conn.declare_topic_consumer(exchange_name='test',
+                                        topic='test2',
+                                        callback=lambda msg: True)
+            conn.declare_fanout_consumer('test3', lambda msg: True)
+            self.assertEqual(3, len(conn.connection._consumers))
+
+            with mock.patch.object(
+                rabbit_driver.Consumer, 'cancel'
+            ) as mock_cancel:
+                conn.connection.stop_consuming()
+                self.assertEqual(3, mock_cancel.call_count)
+
+    def test_stop_consuming_tolerates_cancel_failure(self):
+        """Verify stop_consuming succeeds even if cancel raises."""
+        transport = oslo_messaging.get_transport(self.conf, 'kombu+memory://')
+        self.addCleanup(transport.cleanup)
+        with transport._driver._get_connection(
+                driver_common.PURPOSE_LISTEN) as conn:
+            conn.declare_topic_consumer(exchange_name='test',
+                                        topic='test',
+                                        callback=lambda msg: True)
+
+            with mock.patch.object(
+                rabbit_driver.Consumer, 'cancel',
+                side_effect=Exception('channel closed')
+            ):
+                # Should not raise
+                conn.connection.stop_consuming()
+                self.assertTrue(conn.connection._consume_loop_stopped)
+
+
 class TestRabbitTransportURL(test_utils.BaseTestCase):
 
     scenarios = [
