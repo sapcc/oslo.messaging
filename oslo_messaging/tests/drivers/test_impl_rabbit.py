@@ -1222,3 +1222,66 @@ class TestMsgIdCache(test_utils.BaseTestCase):
 
         # we should not reject duplicate message
         reject_mock.assert_not_called()
+
+
+class TestReplyWaiters(test_utils.BaseTestCase):
+    """Unit tests for ReplyWaiters.get blocking/non-blocking paths."""
+
+    def _make_waiters(self, heartbeat_enabled=False, is_eventlet=False):
+        with mock.patch.object(amqpdriver, '_is_eventlet', is_eventlet):
+            w = amqpdriver.ReplyWaiters(heartbeat_enabled=heartbeat_enabled)
+        return w
+
+    def test_blocking_path_returns_immediately_when_reply_arrives(self):
+        """In threading mode (no eventlet) get() wakes as soon as put() fires."""
+        waiters = self._make_waiters(heartbeat_enabled=False, is_eventlet=False)
+        self.assertTrue(waiters._use_blocking_get)
+
+        msg_id = 'test-msg-1'
+        waiters.add(msg_id)
+
+        reply = {'result': 42}
+        delay = 0.05  # 50 ms
+
+        def _put_after_delay():
+            time.sleep(delay)
+            waiters.put(msg_id, reply)
+
+        t = threading.Thread(target=_put_after_delay)
+        t.start()
+
+        t0 = time.monotonic()
+        result = waiters.get(msg_id, timeout=5.0)
+        elapsed = time.monotonic() - t0
+        t.join()
+
+        self.assertEqual(reply, result)
+        # Should return promptly after the reply arrives, not after 0.5 s sleep.
+        self.assertLess(elapsed, 0.3,
+                        "blocking get should return well within 300 ms")
+
+    def test_non_blocking_path_used_when_eventlet_and_heartbeat(self):
+        """With eventlet + heartbeat the old block=False + sleep path is kept."""
+        waiters = self._make_waiters(heartbeat_enabled=True, is_eventlet=True)
+        self.assertFalse(waiters._use_blocking_get)
+
+        msg_id = 'test-msg-2'
+        waiters.add(msg_id)
+
+        reply = {'result': 99}
+
+        # Put the reply immediately so get() finds it on the first poll.
+        waiters.put(msg_id, reply)
+
+        result = waiters.get(msg_id, timeout=5.0)
+        self.assertEqual(reply, result)
+
+    def test_blocking_path_used_when_eventlet_but_no_heartbeat(self):
+        """eventlet without heartbeat can still use blocking get safely."""
+        waiters = self._make_waiters(heartbeat_enabled=False, is_eventlet=True)
+        self.assertTrue(waiters._use_blocking_get)
+
+    def test_blocking_path_used_when_heartbeat_but_no_eventlet(self):
+        """Pure threading + heartbeat: blocking get is safe."""
+        waiters = self._make_waiters(heartbeat_enabled=True, is_eventlet=False)
+        self.assertTrue(waiters._use_blocking_get)

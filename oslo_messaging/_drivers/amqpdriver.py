@@ -30,6 +30,9 @@ from oslo_messaging._drivers import base
 from oslo_messaging._drivers import common as rpc_common
 from oslo_messaging import MessageDeliveryFailure
 
+# Evaluated once at import time — consistent with _utils.py's stdlib_queue pattern.
+_is_eventlet = eventletutils.is_monkey_patched('thread')
+
 __all__ = ['AMQPDriverBase']
 
 LOG = logging.getLogger(__name__)
@@ -509,23 +512,38 @@ class NotificationAMQPListener(AMQPListener):
 
 class ReplyWaiters:
 
-    def __init__(self):
+    def __init__(self, heartbeat_enabled=False):
         self._queues = {}
         self._wrn_threshold = 10
+        # With eventlet monkey-patching + a pthread heartbeat thread,
+        # queue.get(block=True) starves the heartbeat (lp-2035113).
+        # In all other cases (pure threading, or no heartbeat) blocking is
+        # safe and avoids the 500 ms polling sleep.
+        self._use_blocking_get = not (_is_eventlet and heartbeat_enabled)
 
-    def get(self, msg_id, timeout):
+    def _get_polling(self, msg_id, timeout):
+        # NOTE(amorin) we can't use block=True with eventlet + heartbeat.
+        # See lp-2035113
         watch = timeutils.StopWatch(duration=timeout)
         watch.start()
         while not watch.expired():
             try:
-                # NOTE(amorin) we can't use block=True
-                # See lp-2035113
                 return self._queues[msg_id].get(block=False)
             except queue.Empty:
-                time.sleep(0.5)
+                time.sleep(0.005)
         raise oslo_messaging.MessagingTimeout(
             'Timed out waiting for a reply '
             'to message ID %s' % msg_id)
+
+    def get(self, msg_id, timeout):
+        if not self._use_blocking_get:
+            return self._get_polling(msg_id, timeout)
+        try:
+            return self._queues[msg_id].get(block=True, timeout=timeout)
+        except queue.Empty:
+            raise oslo_messaging.MessagingTimeout(
+                'Timed out waiting for a reply '
+                'to message ID %s' % msg_id)
 
     def put(self, msg_id, message_data):
         LOG.debug('Received RPC response for msg %s', msg_id)
@@ -559,7 +577,8 @@ class ReplyWaiter:
         self.conn = conn
         self.allowed_remote_exmods = allowed_remote_exmods
         self.msg_id_cache = rpc_amqp._MsgIdCache()
-        self.waiters = ReplyWaiters()
+        self.waiters = ReplyWaiters(
+            heartbeat_enabled=conn._heartbeat_supported_and_enabled())
 
         self.conn.declare_direct_consumer(reply_q, self)
 
