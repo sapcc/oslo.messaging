@@ -331,3 +331,108 @@ class TestMonitorFailure(test_utils.BaseTestCase):
         # only one call to heartbeat should be made since the watchdog thread
         # should exit on the first exception thrown
         self.assertEqual(1, incoming.heartbeat.call_count)
+
+
+class TestWatchdogLeakOnFailure(test_utils.BaseTestCase):
+    """Regression tests for a call-monitor watchdog thread leak.
+
+    RPCDispatcher.dispatch() starts the watchdog thread before iterating
+    the endpoint list, but signals completion_event / joins the watchdog
+    only inside the successful-dispatch try/finally.  Three failure paths
+    raise without stopping the watchdog:
+
+      1. NoSuchMethod        - endpoint matches namespace/version but
+                               lacks the requested method.
+      2. Access policy deny  - same fall-through as NoSuchMethod when
+                               access_policy.is_allowed() returns False.
+      3. UnsupportedVersion  - no endpoint matches namespace/version.
+
+    A leaked watchdog keeps calling incoming.heartbeat() every
+    client_timeout/2 seconds for a request the server has already
+    rejected.
+    """
+
+    # Watchdog fires every client_timeout/2 == 1 s once client_timeout=2.
+    # Wait slightly more than that so a leaked watchdog fires at least once.
+    WATCHDOG_QUIESCE_S = 1.2
+
+    def _make_incoming(self, method, namespace=None):
+        incoming = mock.Mock()
+        incoming.message = {'method': method, 'args': {},
+                            'namespace': namespace, 'version': '1.0'}
+        incoming.ctxt = {}
+        # client_timeout must be int >= 2 for the watchdog to fire
+        # (cm_heartbeat_interval = int(client_timeout) / 2 >= 1).
+        incoming.client_timeout = 2
+        return incoming
+
+    def _assert_no_heartbeat_after_raise(self, incoming):
+        time.sleep(self.WATCHDOG_QUIESCE_S)
+        self.assertEqual(
+            0, incoming.heartbeat.call_count,
+            'Watchdog leaked: incoming.heartbeat() was called '
+            f'{incoming.heartbeat.call_count} time(s) after dispatch() '
+            'raised. The watchdog thread was started but never signalled '
+            'via completion_event.set() on the failure path.')
+
+    def test_no_such_method_joins_watchdog(self):
+        """NoSuchMethod: endpoint matches namespace/version, lacks method."""
+        class _Endpoint:
+            target = oslo_messaging.Target()
+
+            def ping(self, ctxt):  # pragma: no cover
+                return 'pong'
+
+        dispatcher = oslo_messaging.RPCDispatcher(
+            [_Endpoint()], serializer=None,
+            access_policy=oslo_messaging.LegacyRPCAccessPolicy)
+        incoming = self._make_incoming('unknown_method')
+
+        self.assertRaises(oslo_messaging.NoSuchMethod,
+                          dispatcher.dispatch, incoming)
+        self._assert_no_heartbeat_after_raise(incoming)
+
+    def test_access_denied_joins_watchdog(self):
+        """Access policy denies the call; falls through as NoSuchMethod."""
+        class _Endpoint:
+            target = oslo_messaging.Target()
+
+            def _private(self, ctxt):  # pragma: no cover
+                return 'private'
+
+        dispatcher = oslo_messaging.RPCDispatcher(
+            [_Endpoint()], serializer=None,
+            access_policy=oslo_messaging.ExplicitRPCAccessPolicy)
+        incoming = self._make_incoming('_private')
+
+        self.assertRaises(oslo_messaging.NoSuchMethod,
+                          dispatcher.dispatch, incoming)
+        self._assert_no_heartbeat_after_raise(incoming)
+
+    def test_unsupported_version_joins_watchdog(self):
+        """UnsupportedVersion: no endpoint's namespace matches the request."""
+        class _Endpoint:
+            target = oslo_messaging.Target(namespace='other')
+
+            def ping(self, ctxt):  # pragma: no cover
+                return 'pong'
+
+        dispatcher = oslo_messaging.RPCDispatcher(
+            [_Endpoint()], serializer=None,
+            access_policy=oslo_messaging.LegacyRPCAccessPolicy)
+        incoming = self._make_incoming('ping', namespace=None)
+
+        self.assertRaises(oslo_messaging.UnsupportedVersion,
+                          dispatcher.dispatch, incoming)
+        self._assert_no_heartbeat_after_raise(incoming)
+
+    def test_no_endpoints_at_all_joins_watchdog(self):
+        """UnsupportedVersion on an empty endpoint list also cleans up."""
+        dispatcher = oslo_messaging.RPCDispatcher(
+            [], serializer=None,
+            access_policy=oslo_messaging.LegacyRPCAccessPolicy)
+        incoming = self._make_incoming('ping')
+
+        self.assertRaises(oslo_messaging.UnsupportedVersion,
+                          dispatcher.dispatch, incoming)
+        self._assert_no_heartbeat_after_raise(incoming)

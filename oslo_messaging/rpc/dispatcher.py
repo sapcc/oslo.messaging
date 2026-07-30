@@ -293,28 +293,31 @@ class RPCDispatcher(dispatcher.DispatcherBase):
             # a timeout, we just never start the watchdog thread.
             watchdog_thread.start()
 
-        found_compatible = False
-        for endpoint in self.endpoints:
-            target = getattr(endpoint, 'target', None)
-            if not target:
-                target = self._default_target
+        # NOTE(fwiesel): stop the watchdog on every exit path, not only
+        # the successful-dispatch return.  NoSuchMethod, access-denied
+        # and UnsupportedVersion all fall through this loop.
+        try:
+            found_compatible = False
+            for endpoint in self.endpoints:
+                target = getattr(endpoint, 'target', None)
+                if not target:
+                    target = self._default_target
 
-            if not (self._is_namespace(target, namespace) and
-                    self._is_compatible(target, version)):
-                continue
+                if not (self._is_namespace(target, namespace) and
+                        self._is_compatible(target, version)):
+                    continue
 
-            if hasattr(endpoint, method):
-                if self.access_policy.is_allowed(endpoint, method):
-                    try:
+                if hasattr(endpoint, method):
+                    if self.access_policy.is_allowed(endpoint, method):
                         return self._do_dispatch(endpoint, method, ctxt, args)
-                    finally:
-                        completion_event.set()
-                        if incoming.client_timeout:
-                            watchdog_thread.join()
 
-            found_compatible = True
+                found_compatible = True
 
-        if found_compatible:
-            raise NoSuchMethod(method)
-        else:
-            raise UnsupportedVersion(version, method=method)
+            if found_compatible:
+                raise NoSuchMethod(method)
+            else:
+                raise UnsupportedVersion(version, method=method)
+        finally:
+            completion_event.set()
+            if incoming.client_timeout:
+                watchdog_thread.join()
