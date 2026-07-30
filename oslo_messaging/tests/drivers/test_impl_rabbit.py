@@ -1270,3 +1270,87 @@ class TestMsgIdCache(test_utils.BaseTestCase):
 
         # we should not reject duplicate message
         reject_mock.assert_not_called()
+
+
+class TestConnectionCloseConcurrency(test_utils.BaseTestCase):
+    """Regression tests for the Connection.close() teardown race.
+
+    Two invariants:
+
+    * close() must call _heartbeat_stop() *before* acquiring
+      _connection_lock, because the heartbeat thread itself takes
+      _connection_lock via for_heartbeat().  Acquiring the lock first
+      and then joining the heartbeat thread would deadlock in
+      production.
+
+    * close() must serialise the teardown block with _connection_lock so
+      two concurrent callers do not race on self.connection = None.
+    """
+
+    def _make_connection(self, lock):
+        """Build a Connection with only the attributes close() touches.
+
+        We bypass __init__ (which opens a broker socket) and populate
+        the fields close() reads.  _heartbeat_stop and
+        _set_current_channel are mocked on the instance.
+        """
+        with mock.patch.object(rabbit_driver.Connection, '__init__',
+                               lambda self: None):
+            conn = rabbit_driver.Connection()
+        conn.connection = mock.Mock()
+        conn._connection_lock = lock
+        conn._consumers = {}
+        conn.rabbit_stream_fanout = False
+        conn.use_queue_manager = True  # skip the fanout-delete branch
+        conn._heartbeat_stop = mock.Mock()
+        conn._set_current_channel = mock.Mock()
+        return conn
+
+    def test_heartbeat_stopped_before_lock_acquired(self):
+        """Regression: close() must not hold _connection_lock across
+        _heartbeat_stop().
+
+        The heartbeat thread holds _connection_lock via for_heartbeat()
+        while running.  Acquiring the lock in close() before stopping
+        the heartbeat would deadlock — close() cannot proceed until the
+        heartbeat thread joins, but the heartbeat thread cannot release
+        the lock because close() already holds it.
+
+        Assert the call ordering with an instrumented context-manager
+        lock: _heartbeat_stop() must have returned before __enter__ is
+        called.
+        """
+        events = []
+        lock = mock.MagicMock()
+        lock.__enter__.side_effect = lambda: events.append('lock_enter')
+        lock.__exit__.side_effect = (
+            lambda *a: events.append('lock_exit') or False)
+
+        conn = self._make_connection(lock)
+        conn._heartbeat_stop.side_effect = (
+            lambda: events.append('heartbeat_stopped'))
+
+        conn.close()
+
+        self.assertLess(
+            events.index('heartbeat_stopped'),
+            events.index('lock_enter'),
+            f"_heartbeat_stop() must run before _connection_lock is "
+            f"acquired; got order: {events}")
+
+    def test_close_is_idempotent(self):
+        """A second close() on an already-closed Connection is a no-op.
+
+        Under concurrent callers, the second one enters close() after
+        the first has torn everything down and set self.connection to
+        None.  It must not raise AttributeError on
+        self.connection.release() — instead it early-returns.
+        """
+        lock = mock.MagicMock()
+        conn = self._make_connection(lock)
+        conn.connection = None  # already-closed state
+
+        conn.close()  # must not raise
+
+        # Nothing to release on a closed connection.
+        conn._set_current_channel.assert_not_called()

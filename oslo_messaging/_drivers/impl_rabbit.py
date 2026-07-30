@@ -1167,8 +1167,13 @@ class Connection:
 
     def close(self):
         """Close/release this connection."""
+        # NOTE(fwiesel): call _heartbeat_stop() before acquiring
+        # _connection_lock; the heartbeat thread itself takes that lock,
+        # so acquiring it here first would deadlock.
         self._heartbeat_stop()
-        if self.connection:
+        with self._connection_lock:
+            if self.connection is None:
+                return
             # NOTE(jcosmao) Delete queue should be called only when queue name
             # is randomized. When using streams, queue is shared between
             # all consumers, thus deleting fanout queue will force all other
