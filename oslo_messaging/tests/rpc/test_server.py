@@ -697,7 +697,12 @@ class TestServerLocking(test_utils.BaseTestCase):
             def _process_incoming(self, incoming):
                 pass
 
-        self.server = MessageHandlingServerImpl(mock.Mock(), mock.Mock())
+        # Use a real ConfigOpts so executor_thread_pool_size resolves to an
+        # integer; MessageHandlingServer reads it via transport.conf.
+        real_conf = cfg.ConfigOpts()
+        transport_mock = mock.Mock()
+        transport_mock.conf = real_conf
+        self.server = MessageHandlingServerImpl(transport_mock, mock.Mock())
         self.server._executor_cls = FakeExecutor
 
     def test_start_stop_wait(self):
@@ -964,6 +969,70 @@ class TestServerLocking(test_utils.BaseTestCase):
 
         # We timed out. Ensure we didn't log anything.
         self.assertFalse(mock_log.warning.called)
+
+
+class TestOnIncomingBackpressure(test_utils.BaseTestCase):
+    """_on_incoming must block when all worker slots are taken."""
+
+    def setUp(self):
+        super().setUp(conf=cfg.ConfigOpts())
+
+        pending = []
+        self.pending = pending
+
+        class HoldingExecutor:
+            """Accepts submitted work but never runs it autonomously."""
+            def __init__(self, max_workers=1, **kwargs):
+                pass
+
+            def submit(self, fn, *args, **kwargs):
+                pending.append((fn, args, kwargs))
+
+            def shutdown(self, wait=True):
+                # Drain pending so any blocked _on_incoming callers are freed.
+                while pending:
+                    fn, args, kwargs = pending.pop(0)
+                    fn(*args, **kwargs)
+
+        class Impl(oslo_messaging.MessageHandlingServer):
+            def _create_listener(self):
+                return mock.Mock()
+
+            def _process_incoming(self, incoming):
+                pass
+
+        real_conf = cfg.ConfigOpts()
+        transport = mock.Mock()
+        transport.conf = real_conf
+        self.server = Impl(transport, mock.Mock())
+        self.server._executor_cls = HoldingExecutor
+
+    def test_blocks_when_full(self):
+        eventlet.spawn(self.server.start, override_pool_size=1)
+        eventlet.sleep(0)  # yield to let start() complete
+        self.addCleanup(self.server.wait)
+        self.addCleanup(self.server.stop)
+
+        # First message occupies the only slot.
+        self.server._on_incoming(['first'])
+        self.assertEqual(1, len(self.pending))
+
+        # Second call must block because the slot is still held.
+        admitted = threading.Event()
+
+        def submit_second():
+            self.server._on_incoming(['second'])
+            admitted.set()
+
+        t = threading.Thread(target=submit_second, daemon=True)
+        t.start()
+        self.assertFalse(admitted.wait(timeout=0.2))
+
+        # Releasing the slot must unblock the waiting call.
+        fn, args, kwargs = self.pending.pop(0)
+        fn(*args, **kwargs)
+        self.assertTrue(admitted.wait(timeout=5))
+        t.join(timeout=5)
 
 
 class TestRPCExposeDecorator(test_utils.BaseTestCase):

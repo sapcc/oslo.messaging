@@ -373,6 +373,7 @@ class MessageHandlingServer(service.ServiceBase, _OrderedTaskRunner,
         self._executor_cls = mgr.driver
 
         self._work_executor = None
+        self._dispatch_sem = None
 
         self._started = False
 
@@ -383,7 +384,18 @@ class MessageHandlingServer(service.ServiceBase, _OrderedTaskRunner,
 
         :param incoming: incoming request.
         """
-        self._work_executor.submit(self._process_incoming, incoming)
+        # Block until a slot is free; bounds the backlog to max_workers to
+        # prevent unbounded queue growth under overload and back-pressures the
+        # listener poll thread into the transport.
+        self._dispatch_sem.acquire()
+
+        def _release_and_process(inc):
+            try:
+                self._process_incoming(inc)
+            finally:
+                self._dispatch_sem.release()
+
+        self._work_executor.submit(_release_and_process, incoming)
 
     @abc.abstractmethod
     def _process_incoming(self, incoming):
@@ -426,6 +438,7 @@ class MessageHandlingServer(service.ServiceBase, _OrderedTaskRunner,
             override_pool_size or self.conf.executor_thread_pool_size
         )
         self._work_executor = self._executor_cls(**executor_opts)
+        self._dispatch_sem = threading.Semaphore(executor_opts["max_workers"])
 
         try:
             self.listener = self._create_listener()
