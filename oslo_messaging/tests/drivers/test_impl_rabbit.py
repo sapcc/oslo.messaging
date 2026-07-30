@@ -1354,3 +1354,60 @@ class TestConnectionCloseConcurrency(test_utils.BaseTestCase):
 
         # Nothing to release on a closed connection.
         conn._set_current_channel.assert_not_called()
+
+
+class TestMessageOperationsHandlerDrain(test_utils.BaseTestCase):
+    """Regression tests for MessageOperationsHandler shutdown drain.
+
+    _process_in_background() must drain any tasks that were enqueued
+    between the last process() iteration and _shutdown being set.
+    Otherwise deferred notification acks are dropped, and the RabbitMQ
+    broker redelivers the notification: the application handler runs
+    twice for the same message.
+    """
+
+    def test_drains_task_enqueued_during_final_sleep(self):
+        """A task enqueued after the last process() but before shutdown
+        must still run.
+
+        Drive _process_in_background() directly on the test thread.
+        The first time it calls time.sleep(), we simulate the race by
+        enqueueing a task AND setting _shutdown.  When sleep returns,
+        the loop condition becomes false; without the drain the task
+        stays in the queue forever.
+        """
+        handler = amqpdriver.MessageOperationsHandler("test")
+        ran = []
+
+        def race_during_sleep(_):
+            handler.do(lambda: ran.append('task'))
+            handler._shutdown.set()
+
+        with mock.patch.object(amqpdriver.time, 'sleep',
+                               side_effect=race_during_sleep):
+            handler._process_in_background()
+
+        self.assertEqual(['task'], ran,
+                         "Task enqueued during the shutdown-window sleep "
+                         "was dropped by _process_in_background()")
+
+    def test_stops_when_shutdown_already_set(self):
+        """When _shutdown is already set on entry, the drain still runs.
+
+        Guards against a naive fix that only drains after the sleep.
+        A task queued before entry must be processed.
+        """
+        handler = amqpdriver.MessageOperationsHandler("test")
+        ran = []
+        handler.do(lambda: ran.append('task'))
+        handler._shutdown.set()
+
+        # time.sleep must never be called in this path.
+        with mock.patch.object(amqpdriver.time, 'sleep',
+                               side_effect=AssertionError(
+                                   "sleep called when shutdown already set")):
+            handler._process_in_background()
+
+        self.assertEqual(['task'], ran,
+                         "Task queued before _process_in_background() with "
+                         "_shutdown already set was dropped")

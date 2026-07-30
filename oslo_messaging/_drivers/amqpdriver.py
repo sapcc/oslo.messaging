@@ -145,6 +145,9 @@ class MessageOperationsHandler:
         while not self._shutdown.is_set():
             self.process()
             time.sleep(ACK_REQUEUE_EVERY_SECONDS_MIN)
+        # Final drain: process tasks queued between the last iteration
+        # and shutdown being set, so notification acks are not dropped.
+        self.process()
 
     def process(self):
         "Run all pending tasks queued by do()."
