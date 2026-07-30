@@ -61,6 +61,7 @@ class MetricsCollectorClient:
         buffer_size = self.conf.metrics_buffer_size
         self.tx_queue = queue.Queue(buffer_size)
         self.next_send_metric = None
+        self._send_thread_lock = threading.Lock()
         self.send_thread = threading.Thread(target=self.send_loop)
         self.send_thread.start()
 
@@ -79,8 +80,15 @@ class MetricsCollectorClient:
                         self.tx_queue.qsize(), self.tx_queue.maxsize, m)
 
         if not self.send_thread.is_alive():
-            self.send_thread = threading.Thread(target=self.send_loop)
-            self.send_thread.start()
+            # NOTE(fwiesel): double-checked locking — the outer
+            # is_alive() avoids taking the lock on the hot path when
+            # the thread is running; the inner is_alive() prevents two
+            # callers that both saw a dead thread from spawning two
+            # replacements.
+            with self._send_thread_lock:
+                if not self.send_thread.is_alive():
+                    self.send_thread = threading.Thread(target=self.send_loop)
+                    self.send_thread.start()
 
         # TODO(tkajinam): This is needed to ensure context switch in eventlet
         # case and may be removed after eventlet support is removed.
@@ -216,12 +224,15 @@ class MetricsCollectorClient:
 
 
 METRICS_COLLECTOR = None
+_METRICS_COLLECTOR_LOCK = threading.Lock()
 
 
 def get_collector(conf):
     global METRICS_COLLECTOR
     if METRICS_COLLECTOR is None:
-        METRICS_COLLECTOR = MetricsCollectorClient(conf)
+        with _METRICS_COLLECTOR_LOCK:
+            if METRICS_COLLECTOR is None:
+                METRICS_COLLECTOR = MetricsCollectorClient(conf)
     return METRICS_COLLECTOR
 
 
